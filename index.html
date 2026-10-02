@@ -905,17 +905,18 @@ function compute(rows, filt){
   sorted.forEach(function(r){ var id=r.client_loan_id; byCase[id]=(byCase[id]||0)+1; r.__an=byCase[id]; });
   var maxAtt=0; sorted.forEach(function(r){ if(r.__an>maxAtt) maxAtt=r.__an; });
 
-  function bkt(n){ return n<=4?String(n):"4+"; }
-  var order=["1","2","3","4","4+"];
+  // Every attempt broken out individually (1, 2, 3, ... up to the max attempt) — no "4th+" collapsing.
+  var order=[]; for(var ai=1; ai<=maxAtt; ai++){ order.push(String(ai)); }
+  if(order.length===0) order=["1"];
   var dialed={},conn={};
   order.forEach(function(o){dialed[o]=0;conn[o]=0;});
   var firstConn={};
   sorted.forEach(function(r){
-    var b=bkt(r.__an); dialed[b]++;
+    var b=String(r.__an); dialed[b]++;
     if(r["Call Status"]==="completed"){ conn[b]++; if(firstConn[r.client_loan_id]===undefined) firstConn[r.client_loan_id]=r.__an; }
   });
   var fcb={}; order.forEach(function(o){fcb[o]=0;});
-  Object.keys(firstConn).forEach(function(id){ fcb[bkt(firstConn[id])]++; });
+  Object.keys(firstConn).forEach(function(id){ fcb[String(firstConn[id])]++; });
   var cum=0, payoff=[];
   order.forEach(function(o){
     cum+=fcb[o];
@@ -1041,11 +1042,9 @@ function computeSS(rawRows){
   var bestCat={};
   ans.forEach(function(r){ var c=bestCat[r.client_loan_id]; if(c===undefined||SS_CATPRIO[r.__cat]<SS_CATPRIO[c]) bestCat[r.client_loan_id]=r.__cat; });
   var catCases={}; Object.keys(bestCat).forEach(function(id){var c=bestCat[id];catCases[c]=(catCases[c]||0)+1;});
-  var posCases=catCases["Positive"]||0;
-  var ncSet={}; ans.forEach(function(r){ if(r.__cat==="NC") ncSet[r.client_loan_id]=1; });
-  var ncCases=Object.keys(ncSet).length;
-  var answerRate=uc?reached/uc:0, unansRate=uc?(uc-reached)/uc:0, ncRate=reached?ncCases/reached:0, posRate=uc?posCases/uc:0;
-  // VB Response x cases (book-level, ANSWERED/UNANSWERED x best category, NC fallback) — matches firm's grain
+
+  // Book-level best category per case (dashboard's best_vb_cat grain): reached cases use their
+  // ever-best answered category; UNREACHED cases default to NC. Built once, reused by KPIs + VB Response.
   var caseComp={}, caseBestCat={};
   rows.forEach(function(r){
     if(r["Call Status"]==="completed"){
@@ -1055,6 +1054,15 @@ function computeSS(rawRows){
       if(cur===undefined||SS_CATPRIO[c]<SS_CATPRIO[cur]) caseBestCat[r.client_loan_id]=c;
     } else { if(caseComp[r.client_loan_id]===undefined) caseComp[r.client_loan_id]=caseComp[r.client_loan_id]||0; }
   });
+  // book-level category counts (unreached -> NC)
+  var bookCat={};
+  Object.keys(caseSet).forEach(function(id){ var ct=caseComp[id]?(caseBestCat[id]||"NC"):"NC"; bookCat[ct]=(bookCat[ct]||0)+1; });
+  var posCases=bookCat["Positive"]||0;           // Positive cases (book-level)
+  var ncCases=bookCat["NC"]||0;                   // NC-category cases incl. unreached (dashboard grain)
+  // KPIs — all against the full book, matching the dashboard's countIf(action_type not in ['']) denominator
+  var answerRate=uc?reached/uc:0, unansRate=uc?(uc-reached)/uc:0, ncRate=uc?ncCases/uc:0, posRate=uc?posCases/uc:0;
+
+  // VB Response x cases (book-level, ANSWERED/UNANSWERED x best category, NC fallback) — matches firm's grain
   var respGroups={}; // "ANSWERED||Positive" -> count
   Object.keys(caseSet).forEach(function(id){
     var action, ct;
@@ -1126,7 +1134,7 @@ function renderSS(m,fileName,filtDesc){
   H+="<div class='ss-kpis'>"+
     ssKcard("Answer Rate \u2014 Voicebot",pct(m.answerRate),"reached \u00f7 book ("+fmtInt(m.reached)+" \u00f7 "+fmtInt(m.uc)+")")+
     ssKcard("Unanswered Rate \u2014 Voicebot",pct(m.unansRate),"never reached \u00f7 book")+
-    ssKcard("NC Rate \u2014 Voicebot",pct(m.ncRate),"NC cases \u00f7 reached")+
+    ssKcard("NC Rate \u2014 Voicebot",pct(m.ncRate),"NC cases \u00f7 book ("+fmtInt(m.ncCases)+" \u00f7 "+fmtInt(m.uc)+")")+
     ssKcard("Positive Rate \u2014 Voicebot",pct(m.posRate),"positive cases \u00f7 book")+"</div>";
   H+="<div class='ss-hd'>Response Distribution</div><div class='ss-g2'>";
   H+="<div class='ss-card'><h3>VB Response \u00d7 Cases</h3>"+ssBarTable(m.respRows.concat([{cases:m.uc,pctBook:1,__sum:1}]),
@@ -1241,7 +1249,8 @@ function render(m){
   var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; ";
   durNote += (m.ncAns>0 && m.ncDur!=null) ? "non-contact (NC) avg = "+m.ncDur.toFixed(1)+"s"
                                           : "hung-up avg = "+(m.huDur!=null?m.huDur.toFixed(1):"\u2013")+"s";
-  var labels={"1":"1st","2":"2nd","3":"3rd","4":"4th","4+":"4th+"};
+  function ordinal(n){ n=parseInt(n,10); var s=["th","st","nd","rd"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
+  function attLabel(b){ return b==="4+"?"4th+":ordinal(b); }
 
   // N.A. helpers for Positive/PTP when a disposition filter excludes the relevant codes
   var posOK=(m.posApplicable!==false), ptpOK=(m.ptpApplicable!==false);
@@ -1285,7 +1294,7 @@ function render(m){
   var fnRows=fn.map(function(x){return "<tr><td>"+x[0]+"</td><td class='num'>"+x[1]+"</td><td class='num "+x[3]+"'>"+x[2]+"</td></tr>";}).join("");
 
   var poRows=m.payoff.map(function(p){
-    return "<tr><td class='num'>"+labels[p.b]+"</td><td class='num'>"+fmtInt(p.dialed)+"</td><td class='num'>"+fmtInt(p.conn)+"</td><td class='num'>"+(p.cr==null?"\u2014":pct(p.cr))+"</td><td class='num green'>"+pct(p.ocr)+"</td></tr>";
+    return "<tr><td class='num'>"+attLabel(p.b)+"</td><td class='num'>"+fmtInt(p.dialed)+"</td><td class='num'>"+fmtInt(p.conn)+"</td><td class='num'>"+(p.cr==null?"\u2014":pct(p.cr))+"</td><td class='num green'>"+pct(p.ocr)+"</td></tr>";
   }).join("");
 
   var funnelNote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
@@ -1306,7 +1315,7 @@ function render(m){
    "<div class='sec'><h3>3.  Call Funnel \u2014 Calls</h3><table><tr><th>Stage</th><th class='num'>Calls</th><th class='num'>% of attempted</th></tr>"+fnRows+"</table>"+
      "<div class='note'>"+funnelNote+"</div></div>"+
    "<div class='sec'><h3>4.  Marginal Payoff by Attempt</h3><table><tr><th class='num'>Attempt</th><th class='num'>Cases dialed</th><th class='num'>Connected</th><th class='num'>Connect rate</th><th class='num'>Overall connect</th></tr>"+poRows+"</table>"+
-     "<div class='note'>\u201cCases dialed\u201d = call attempts (dials), not unique cases. \u201c4th+\u201d covers the 5th attempt onward; 5th\u2013"+m.maxAtt+"th attempts total "+fmtInt(m.dials4plus)+" dials.</div></div>"+
+     "<div class='note'>\u201cCases dialed\u201d = call attempts (dials), not unique cases. Each attempt is shown individually, up to the maximum of "+m.maxAtt+" attempts.</div></div>"+
    "<div class='chartbox'><h3>Daily Outreach Trend</h3><canvas id='trend' height='300'></canvas>"+
      "<div class='legend'><span><i style='background:"+"#1F3864"+"'></i>Total Calls</span><span><i style='background:#C9A227'></i>Unique Cases</span></div></div>";
 
@@ -1505,16 +1514,16 @@ async function exportXlsx(){
     // Section 4
     sectionBar("4.  Marginal Payoff by Attempt");
     headerRow([["B","Attempt","center"],["C","Cases dialed","center"],["D","Connected","center"],["E","Connect rate","center"],["F","Overall connect","center"]]); r++;
-    var lab={"1":"1st","2":"2nd","3":"3rd","4":"4th","4+":"4th+"};
+    function ordX(n){ n=parseInt(n,10); var s=["th","st","nd","rd"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
     m.payoff.forEach(function(p,i){ var fill=i%2?C_ZEBRA:C_WHITE;
-      setCell("B"+r,lab[p.b],{size:10,fill:fill,align:"center",border:true});
+      setCell("B"+r,(p.b==="4+"?"4th+":ordX(p.b)),{size:10,fill:fill,align:"center",border:true});
       setCell("C"+r,p.dialed,{size:10,fill:fill,align:"center",border:true,num:"#,##0"});
       setCell("D"+r,p.conn,{size:10,fill:fill,align:"center",border:true,num:"#,##0"});
       if(p.cr==null) setCell("E"+r,"\u2014",{size:10,fill:fill,align:"center",border:true});
       else setCell("E"+r,p.cr,{size:10,fill:fill,align:"center",border:true,num:"0.0%"});
       setCell("F"+r,p.ocr,{size:10,bold:true,color:C_GREEN,fill:fill,align:"center",border:true,num:"0.0%"});
       ws.getRow(r).height=16; r++; });
-    setCell("B"+r,"\u201cCases dialed\u201d = call attempts (dials), not unique cases. \u201c4th+\u201d covers the 5th attempt onward; 5th\u2013"+m.maxAtt+"th attempts total "+fmtInt(m.dials4plus)+" dials.",{size:8,italic:true,color:C_GREY,wrap:true});
+    setCell("B"+r,"\u201cCases dialed\u201d = call attempts (dials), not unique cases. Each attempt is shown individually, up to the maximum of "+m.maxAtt+" attempts.",{size:8,italic:true,color:C_GREY,wrap:true});
     ws.getCell("B"+r).alignment={horizontal:"left",vertical:"top",wrapText:true}; merge("B"+r+":F"+r); ws.getRow(r).height=32;
 
     // Daily Trend tab (styled table)
@@ -2140,11 +2149,11 @@ function exportPdf(){
 
     // 4. Marginal Payoff
     bar("4.  Marginal Payoff by Attempt");
-    var lab={"1":"1st","2":"2nd","3":"3rd","4":"4th","4+":"4th+"};
+    function ordP(n){ n=parseInt(n,10); var s=["th","st","nd","rd"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
     sectionTable(null,["Attempt","Cases dialed","Connected","Connect rate","Overall connect"],
-      m.payoff.map(function(p){return [lab[p.b],fmtInt(p.dialed),fmtInt(p.conn),(p.cr==null?"\u2014":pct(p.cr)),pct(p.ocr)];}),
+      m.payoff.map(function(p){return [(p.b==="4+"?"4th+":ordP(p.b)),fmtInt(p.dialed),fmtInt(p.conn),(p.cr==null?"\u2014":pct(p.cr)),pct(p.ocr)];}),
       {0:{halign:'center'},1:{halign:'center'},2:{halign:'center'},3:{halign:'center'},4:{halign:'center',fontStyle:'bold',textColor:GREEN}});
-    note("\u201cCases dialed\u201d = call attempts (dials), not unique cases. \u201c4th+\u201d covers the 5th attempt onward; 5th\u2013"+m.maxAtt+"th attempts total "+fmtInt(m.dials4plus)+" dials.");
+    note("\u201cCases dialed\u201d = call attempts (dials), not unique cases. Each attempt is shown individually, up to the maximum of "+m.maxAtt+" attempts.");
 
     // Daily Trend chart (as image)
     var cv=document.getElementById('trend');
