@@ -212,6 +212,10 @@
     .fpanel{position:fixed;left:280px;top:0;height:100vh;z-index:30;transform:translateX(-110%);transition:transform .2s;box-shadow:8px 0 30px rgba(42,38,34,.14)}
     .fpanel.open{transform:translateX(0)}
     .fpToggle{display:inline-flex}
+    /* desktop 'collapsed' preference never applies to the overlay */
+    .fpanel.collapsed{width:274px;flex:0 0 274px}
+    .fpanel.collapsed .fhead{display:flex} .fpanel.collapsed .facc{display:block}
+    .fpanel.collapsed .fsummary:not(:empty){display:flex} .fpanel.collapsed .fexpand{display:none}
   }
   @media (max-width:760px){
     .app{flex-direction:column}
@@ -220,6 +224,14 @@
     .files{max-height:150px}
     .kpis{grid-template-columns:repeat(2,1fr)}
     .kpi:last-child{grid-column:span 2}
+    /* phone top bar: wrap into rows instead of pushing buttons off-screen */
+    .topbar{flex-wrap:wrap;gap:8px;padding:10px 12px}
+    .topbar .btn,.viewtoggle button{white-space:nowrap}
+    .topbar .btn{padding:7px 12px;font-size:12px}
+    .topbar .btn.pdf,.topbar .btn.xls{order:1}
+    .topbar .cur{order:2;flex-basis:100%;font-size:12.5px}
+    .ss-kpis,.ss-g2{grid-template-columns:1fr}
+    .stage{padding:12px}
   }
 </style>
 </head>
@@ -897,41 +909,61 @@ function compute(rows, filt){
   var oddCounts={};
   rows.forEach(function(r){ var st=r["Call Status"]; if(st && st!=="completed" && st!=="failed" && st!=="__filtered__"){ oddCounts[st]=(oddCounts[st]||0)+1; } });
 
-  // attempts / payoff (sort by Call Attempt Time; blank/undefined timestamps sort LAST, matching pandas)
+  // attempts (sort by Call Attempt Time; blank/undefined timestamps sort LAST, matching pandas)
   var byCase={};
   function tkey(r){ var t=r["Call Attempt Time"]; return (t===undefined||t===null||String(t).trim()==="") ? "\uffff" : String(t); }
   var sorted=rows.slice().sort(function(a,b){ return tkey(a).localeCompare(tkey(b)); });
-  var attemptNo=[];
   sorted.forEach(function(r){ var id=r.client_loan_id; byCase[id]=(byCase[id]||0)+1; r.__an=byCase[id]; });
   var maxAtt=0; sorted.forEach(function(r){ if(r.__an>maxAtt) maxAtt=r.__an; });
 
-  // Every attempt broken out individually (1, 2, 3, ... up to the max attempt) — no "4th+" collapsing.
-  var order=[]; for(var ai=1; ai<=maxAtt; ai++){ order.push(String(ai)); }
-  if(order.length===0) order=["1"];
-  var dialed={},conn={};
-  order.forEach(function(o){dialed[o]=0;conn[o]=0;});
-  var firstConn={};
+  // ---- Day-wise Marginal Payoff ----
+  // Per case, per calendar day: "Days' Attempt" = the nth dial of that case within the day (resets daily).
+  // "Total Attempt" = a continuous row counter across days. Daily connected rate = cumulative distinct
+  // cases reached within the day / that day's book (resets each day). Overall connect = cumulative distinct
+  // cases reached across the whole campaign / total book (never resets).
+  function dkey(r){ return istDayKey(r["Call Attempt Time"]); }   // IST calendar day
+  var dayCaseSeq={}; // date|case -> running count that day
+  sorted.forEach(function(r){ var d=dkey(r); if(!d){ r.__dseq=null; return; } var k=d+"|"+r.client_loan_id; dayCaseSeq[k]=(dayCaseSeq[k]||0)+1; r.__dseq=dayCaseSeq[k]; });
+  // group dials by date -> day-slot
+  var days={}; // date -> {book:Set, slots:{slot:{dialed,connReachedSet}}}
   sorted.forEach(function(r){
-    var b=String(r.__an); dialed[b]++;
-    if(r["Call Status"]==="completed"){ conn[b]++; if(firstConn[r.client_loan_id]===undefined) firstConn[r.client_loan_id]=r.__an; }
+    var d=dkey(r); if(!d||r.__dseq==null) return;
+    if(!days[d]) days[d]={bookSet:{}, slots:{}};
+    days[d].bookSet[r.client_loan_id]=1;
+    var s=r.__dseq; if(!days[d].slots[s]) days[d].slots[s]={dialed:0, conn:0, reached:{}};
+    var S=days[d].slots[s]; S.dialed++;
+    if(r["Call Status"]==="completed"){ S.conn++; S.reached[r.client_loan_id]=1; }
   });
-  var fcb={}; order.forEach(function(o){fcb[o]=0;});
-  Object.keys(firstConn).forEach(function(id){ fcb[String(firstConn[id])]++; });
-  var cum=0, payoff=[];
-  order.forEach(function(o){
-    cum+=fcb[o];
-    var cr = dialed[o]>0 ? conn[o]/dialed[o] : null;
-    payoff.push({b:o, dialed:dialed[o], conn:conn[o], cr:cr, ocr: uc? cum/uc : 0});
+  var dayAttempt=[]; var totalCounter=0; var overallReached={};
+  Object.keys(days).sort().forEach(function(d){
+    var D=days[d]; var dayBook=Object.keys(D.bookSet).length; var dayReached={};
+    var slotNums=Object.keys(D.slots).map(Number).sort(function(a,b){return a-b;});
+    slotNums.forEach(function(s){
+      totalCounter++;
+      var S=D.slots[s];
+      var cr = S.dialed>0 ? S.conn/S.dialed : null;
+      Object.keys(S.reached).forEach(function(id){ dayReached[id]=1; overallReached[id]=1; });
+      var dailyRate = dayBook ? Object.keys(dayReached).length/dayBook : 0;
+      var overallRate = uc ? Object.keys(overallReached).length/uc : 0;
+      dayAttempt.push({date:d, daySlot:s, total:totalCounter, dialed:S.dialed, conn:S.conn, cr:cr, dailyRate:dailyRate, overallRate:overallRate});
+    });
   });
-  var dials4plus=0; sorted.forEach(function(r){ if(r.__an>=5) dials4plus++; });
+  // Dials with no usable timestamp can't sit on a calendar day. Show them as a final "Undated" row so the
+  // grid reconciles to Calls Attempted; any connects among them still count toward Overall connect.
+  var undD=0, undC=0;
+  sorted.forEach(function(r){ if(dkey(r)) return; undD++; if(r["Call Status"]==="completed"){ undC++; overallReached[r.client_loan_id]=1; } });
+  if(undD>0){
+    dayAttempt.push({date:"Undated", daySlot:null, total:null, dialed:undD, conn:undC, cr:undD?undC/undD:null,
+      dailyRate:null, overallRate: uc ? Object.keys(overallReached).length/uc : 0, undated:true});
+  }
+  // keep a simple overall payoff too (used nowhere critical now, but harmless)
+  var payoff=[], dials4plus=0;
 
   // daily
   var daily={}, nullTs=0;
   rows.forEach(function(r){
-    var t=String(r["Call Attempt Time"]||"");
-    var m=t.match(/^(\d{4}-\d{2}-\d{2})/);
-    if(!m){ nullTs++; return; }
-    var d=m[1];
+    var d=istDayKey(r["Call Attempt Time"]);   // IST calendar day
+    if(!d){ nullTs++; return; }
     if(!daily[d]) daily[d]={calls:0, cases:{}};
     daily[d].calls++; daily[d].cases[r.client_loan_id]=1;
   });
@@ -946,7 +978,7 @@ function compute(rows, filt){
     avgDur:mean(allDur), engDur:mean(engaged), ncDur:mean(ncDur), huDur:mean(huDur),
     ptpCalls:ptpCalls, posCalls:posCalls, ptpCases:ptpCases, posCases:posCases,
     ncAns:ncAns, blankAns:blankAns, oddCounts:oddCounts, nullTs:nullTs,
-    payoff:payoff, dials4plus:dials4plus, daily:dailyArr,
+    payoff:payoff, dials4plus:dials4plus, dayAttempt:dayAttempt, daily:dailyArr,
     filter:(filt&&filt.dir&&filt.dir!=="all")?{dir:filt.dir,sec:filt.sec}:null, reclassified:reclassified,
     posApplicable:posApplicable, ptpApplicable:ptpApplicable,
     colFilters:(function(){ var out={}; var c=(filt&&filt.cols)?filt.cols:{}; Object.keys(c).forEach(function(k){ if(c[k]&&c[k].length) out[k]=c[k].slice(); }); return Object.keys(out).length?out:null; })()
@@ -971,6 +1003,7 @@ function packRaw(rows){
       if("product_label" in r) o["product_label"]=r["product_label"];
       if("call_disconnect_reason" in r) o["call_disconnect_reason"]=r["call_disconnect_reason"];
       if("classification" in r) o["classification"]=r["classification"];
+      if("Created At" in r) o["Created At"]=r["Created At"];   // dashboard buckets time/day on this
       return o;
     });
 }
@@ -1027,8 +1060,18 @@ function ssCat(sub,dur){
   return "NA";
 }
 function ssLang(a){ var m=a&&String(a).match(/-\s*([A-Za-z]+)\s*\+/); return m?m[1]:"\u2014"; }
-function ssHour(ts){ var m=String(ts).match(/\s(\d{2}):/); return m?parseInt(m[1],10):null; }
-function ssDow(ts){ var d=new Date(String(ts).replace(' ','T')); return isNaN(d)?null:d.getUTCDay(); }
+/* ---- IST time helpers ----
+   Call files carry UTC timestamps ("...+00:00"); the business day and hour are IST (UTC+5:30).
+   Every date/hour in the tool is derived through these, so views can never disagree.
+   A timestamp without an offset is treated as UTC (not the viewer's local zone). */
+function parseTs(ts){ if(ts===undefined||ts===null) return null; var s=String(ts).trim(); if(!s) return null;
+  s=s.replace(" ","T"); if(!/(Z|[+-]\d{2}:?\d{2})$/.test(s)) s+="Z"; var d=new Date(s); return isNaN(d)?null:d; }
+function istDate(ts){ var d=parseTs(ts); return d?new Date(d.getTime()+19800000):null; }
+function istDayKey(ts){ var d=istDate(ts); return d?d.toISOString().slice(0,10):null; }
+function ssHour(ts){ var d=istDate(ts); return d?d.getUTCHours():null; }
+function ssDow(ts){ var d=istDate(ts); return d?d.getUTCDay():null; }
+/* Dashboard buckets time/day on communication creation time ("Created At"); fall back to attempt time. */
+function ssWhen(r){ var c=r["Created At"]; return (c!==undefined&&c!==null&&String(c).trim()!=="")?c:r["Call Attempt Time"]; }
 var SS_DOW=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 
 /* Compute Superset model from raw rows (already filtered by the shared filter). */
@@ -1095,10 +1138,10 @@ function computeSS(rawRows){
       return{key:k,comm:G.comm,conn:G.comm?G.ansCalls/G.comm:0,posRate:G.comm?G.posCalls/G.comm:0,dur45:G.ansCalls?G.dur45/G.ansCalls:0};}).sort(function(a,b){return b.comm-a.comm;}); }
   var byTemplate=connBy(function(r){return r["Agent Name"]||"\u2014";});
   var byLang=connBy(function(r){return ssLang(r["Agent Name"]);});
-  var byDow=connBy(function(r){var d=ssDow(r["Call Attempt Time"]);return d===null?null:SS_DOW[d];});
-  function tod(h){if(h===null)return null;if(h<10)return"08am-10am";if(h<12)return"10am-12pm";if(h<14)return"12pm-02pm";if(h<16)return"02pm-04pm";if(h<18)return"04pm-06pm";return"06pm+";}
-  var byTod=connBy(function(r){return tod(ssHour(r["Call Attempt Time"]));});
-  var daily={}; rows.forEach(function(r){var m=String(r["Call Attempt Time"]||"").match(/^(\d{4}-\d{2}-\d{2})/);if(!m)return;var d=m[1];if(!daily[d])daily[d]={calls:0,cases:{},cats:{}};daily[d].calls++;daily[d].cases[r.client_loan_id]=1;if(r["Call Status"]==="completed"){var c=ssCat(r.disposition,r.__d);daily[d].cats[c]=(daily[d].cats[c]||0)+1;}});
+  var byDow=connBy(function(r){var d=ssDow(ssWhen(r));return d===null?null:SS_DOW[d];});
+  function tod(h){if(h===null)return null;if(h>=8&&h<=9)return"08am-10am";if(h>=10&&h<=11)return"10am-12pm";if(h>=12&&h<=13)return"12pm-02pm";if(h>=14&&h<=15)return"02pm-04pm";if(h>=16&&h<=17)return"04pm-06pm";if(h>=18&&h<=19)return"06pm-08pm";return"Other";}
+  var byTod=connBy(function(r){return tod(ssHour(ssWhen(r)));});
+  var daily={}; rows.forEach(function(r){var d=istDayKey(r["Call Attempt Time"]);if(!d)return;if(!daily[d])daily[d]={calls:0,cases:{},cats:{}};daily[d].calls++;daily[d].cases[r.client_loan_id]=1;if(r["Call Status"]==="completed"){var c=ssCat(r.disposition,r.__d);daily[d].cats[c]=(daily[d].cats[c]||0)+1;}});
   var dailyArr=Object.keys(daily).sort().map(function(d){var D=daily[d];var uc2=Object.keys(D.cases).length;return{date:d,calls:D.calls,cases:uc2,avg:uc2?D.calls/uc2:0,cats:D.cats};});
   return {total:rows.length,uc:uc,na:na,reached:reached,answerRate:answerRate,unansRate:unansRate,ncRate:ncRate,posRate:posRate,posCases:posCases,ncCases:ncCases,
     respRows:respRows,attRows:attRows,durConn:durConn,durHung:durHung,allDur:allDur,dispRows:dispRows,byTemplate:byTemplate,byLang:byLang,byDow:byDow,byTod:byTod,daily:dailyArr};
@@ -1126,7 +1169,7 @@ function ssConn(rows,label,wide){var top=rows.slice(0,wide?8:12);
     {label:"Positive",n:true,render:function(r){return pct(r.posRate);}},
     {label:"Dur>45s",n:true,render:function(r){return pct(r.dur45);}}],"comm");}
 function ssOrderDow(rows){var o=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];return rows.slice().sort(function(a,b){return o.indexOf(a.key)-o.indexOf(b.key);});}
-function ssOrderTod(rows){var o=["08am-10am","10am-12pm","12pm-02pm","02pm-04pm","04pm-06pm","06pm+"];return rows.slice().sort(function(a,b){return o.indexOf(a.key)-o.indexOf(b.key);});}
+function ssOrderTod(rows){var o=["08am-10am","10am-12pm","12pm-02pm","02pm-04pm","04pm-06pm","06pm-08pm","Other"];return rows.slice().sort(function(a,b){return o.indexOf(a.key)-o.indexOf(b.key);});}
 
 function renderSS(m,fileName,filtDesc){
   var H="";
@@ -1244,7 +1287,7 @@ function render(m){
   MODEL=m;
   var posCasePct = m.ca? m.posCases/m.ca:0, ptpCasePct=m.ca? m.ptpCases/m.ca:0;
   var attNote="All dial attempts";
-  var extras=Object.keys(m.oddCounts).map(function(k){return m.oddCounts[k]+" "+k;});
+  var extras=Object.keys(m.oddCounts).map(function(k){return m.oddCounts[k]+" "+escapeHtml(k);});   // Call Status values are data
   if(extras.length) attNote+=" (incl. "+extras.join(", ")+" as failed)";
   var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; ";
   durNote += (m.ncAns>0 && m.ncDur!=null) ? "non-contact (NC) avg = "+m.ncDur.toFixed(1)+"s"
@@ -1293,15 +1336,23 @@ function render(m){
   ];
   var fnRows=fn.map(function(x){return "<tr><td>"+x[0]+"</td><td class='num'>"+x[1]+"</td><td class='num "+x[3]+"'>"+x[2]+"</td></tr>";}).join("");
 
-  var poRows=m.payoff.map(function(p){
-    return "<tr><td class='num'>"+attLabel(p.b)+"</td><td class='num'>"+fmtInt(p.dialed)+"</td><td class='num'>"+fmtInt(p.conn)+"</td><td class='num'>"+(p.cr==null?"\u2014":pct(p.cr))+"</td><td class='num green'>"+pct(p.ocr)+"</td></tr>";
+  // Day-wise payoff grid; subtle divider when the date changes
+  var poRows=m.dayAttempt.map(function(p,i){
+    var newDay = i>0 && m.dayAttempt[i-1].date!==p.date;
+    var topBorder = newDay ? " style='border-top:2px solid #cdd4c2'" : "";
+    var u=!!p.undated, dash="\u2014";
+    return "<tr"+topBorder+(u?" title='Dials with no call timestamp \u2014 cannot be placed on a day'":"")+"><td style='white-space:nowrap'>"+(u?"<i>Undated</i>":p.date)+"</td><td class='num'>"+(u?dash:attLabel(String(p.daySlot)))+"</td><td class='num'>"+(u?dash:attLabel(String(p.total)))+"</td>"+
+      "<td class='num'>"+fmtInt(p.dialed)+"</td><td class='num'>"+fmtInt(p.conn)+"</td>"+
+      "<td class='num'>"+(p.cr==null?"\u2014":pct(p.cr))+"</td>"+
+      "<td class='num amber'>"+(p.dailyRate==null?"\u2014":pct(p.dailyRate))+"</td>"+
+      "<td class='num green'>"+pct(p.overallRate)+"</td></tr>";
   }).join("");
 
   var funnelNote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
 
   var subLine = m.sub + filterDesc(m);
   var html =
-   "<div class='banner'><h2>"+m.title+"</h2><div class='sub'>"+subLine+"</div></div>"+
+   "<div class='banner'><h2>"+escapeHtml(m.title)+"</h2><div class='sub'>"+escapeHtml(subLine)+"</div></div>"+
    "<div class='kpis'>"+
      kpiCell(fmtInt(m.uc),"Unique Cases",false)+
      kpiCell(fmtInt(m.total),"Calls Attempted",false)+
@@ -1314,8 +1365,8 @@ function render(m){
      "<div class='note'>* Positive / PTP counted on an ever-basis. Positive = PAID, PTP, PARTIAL_PAID, FPTP, CP, BPTP, NACH_REP. NC (non-contact) excluded.</div></div>"+
    "<div class='sec'><h3>3.  Call Funnel \u2014 Calls</h3><table><tr><th>Stage</th><th class='num'>Calls</th><th class='num'>% of attempted</th></tr>"+fnRows+"</table>"+
      "<div class='note'>"+funnelNote+"</div></div>"+
-   "<div class='sec'><h3>4.  Marginal Payoff by Attempt</h3><table><tr><th class='num'>Attempt</th><th class='num'>Cases dialed</th><th class='num'>Connected</th><th class='num'>Connect rate</th><th class='num'>Overall connect</th></tr>"+poRows+"</table>"+
-     "<div class='note'>\u201cCases dialed\u201d = call attempts (dials), not unique cases. Each attempt is shown individually, up to the maximum of "+m.maxAtt+" attempts.</div></div>"+
+   "<div class='sec'><h3>4.  Marginal Payoff by Attempt (day-wise)</h3><table><tr><th>Date</th><th class='num'>Days&#39; Attempt</th><th class='num'>Total Attempt</th><th class='num'>Cases dialed</th><th class='num'>Connected</th><th class='num'>Connect rate</th><th class='num'>Daily connected rate</th><th class='num'>Overall connect</th></tr>"+poRows+"</table>"+
+     "<div class='note'>\u201cCases dialed\u201d = call attempts (dials), not unique cases. Days&#39; Attempt resets each day; Total Attempt counts continuously across days. Daily connected rate = cumulative cases reached within the day \u00f7 that day&#39;s book (resets daily); Overall connect = cumulative cases reached \u00f7 total book. Dates are IST; dials with no call timestamp are shown as \u201cUndated\u201d so the grid totals Calls Attempted.</div></div>"+
    "<div class='chartbox'><h3>Daily Outreach Trend</h3><canvas id='trend' height='300'></canvas>"+
      "<div class='legend'><span><i style='background:"+"#1F3864"+"'></i>Total Calls</span><span><i style='background:#C9A227'></i>Unique Cases</span></div></div>";
 
@@ -1334,6 +1385,7 @@ function kpiCell(v,l,gold){ return "<div class='kpi"+(gold?" gold":"")+"'><div c
 /* ---------- Simple canvas chart (no external chart lib) ---------- */
 function drawChart(daily){
   var cv=document.getElementById('trend'); if(!cv) return;
+  if(!daily || !daily.length){ var c0=cv.getContext('2d'); c0.clearRect(0,0,cv.width,cv.height); return; }   // nothing to plot
   var ratio=window.devicePixelRatio||1;
   var W=cv.clientWidth||900, H=300;
   cv.width=W*ratio; cv.height=H*ratio; var ctx=cv.getContext('2d'); ctx.scale(ratio,ratio);
@@ -1421,7 +1473,7 @@ async function exportXlsx(){
   try{
     var wb=new ExcelJS.Workbook();
     var ws=wb.addWorksheet("Summary",{views:[{showGridLines:false}],pageSetup:{orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0}});
-    ws.columns=[{width:2},{width:36},{width:16},{width:18},{width:16},{width:16},{width:4}];
+    ws.columns=[{width:2},{width:36},{width:16},{width:18},{width:16},{width:16},{width:16},{width:18},{width:16},{width:4}];
     var posCasePct=m.ca?m.posCases/m.ca:0, ptpCasePct=m.ca?m.ptpCases/m.ca:0;
     var xPosOK=(m.posApplicable!==false), xPtpOK=(m.ptpApplicable!==false), XNA="N.A.";
     function xPos(v){ return xPosOK?v:XNA; } function xPtp(v){ return xPtpOK?v:XNA; }
@@ -1511,20 +1563,24 @@ async function exportXlsx(){
     var fnote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
     setCell("B"+r,fnote,{size:8,italic:true,color:C_GREY,wrap:true}); ws.getCell("B"+r).alignment={horizontal:"left",vertical:"top",wrapText:true}; merge("B"+r+":F"+r); ws.getRow(r).height=20; r+=2;
 
-    // Section 4
-    sectionBar("4.  Marginal Payoff by Attempt");
-    headerRow([["B","Attempt","center"],["C","Cases dialed","center"],["D","Connected","center"],["E","Connect rate","center"],["F","Overall connect","center"]]); r++;
+    // Section 4 — day-wise
+    sectionBar("4.  Marginal Payoff by Attempt (day-wise)");
+    headerRow([["B","Date","center"],["C","Days' Attempt","center"],["D","Total Attempt","center"],["E","Cases dialed","center"],["F","Connected","center"],["G","Connect rate","center"],["H","Daily connected rate","center"],["I","Overall connect","center"]]); r++;
     function ordX(n){ n=parseInt(n,10); var s=["th","st","nd","rd"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
-    m.payoff.forEach(function(p,i){ var fill=i%2?C_ZEBRA:C_WHITE;
-      setCell("B"+r,(p.b==="4+"?"4th+":ordX(p.b)),{size:10,fill:fill,align:"center",border:true});
-      setCell("C"+r,p.dialed,{size:10,fill:fill,align:"center",border:true,num:"#,##0"});
-      setCell("D"+r,p.conn,{size:10,fill:fill,align:"center",border:true,num:"#,##0"});
-      if(p.cr==null) setCell("E"+r,"\u2014",{size:10,fill:fill,align:"center",border:true});
-      else setCell("E"+r,p.cr,{size:10,fill:fill,align:"center",border:true,num:"0.0%"});
-      setCell("F"+r,p.ocr,{size:10,bold:true,color:C_GREEN,fill:fill,align:"center",border:true,num:"0.0%"});
+    m.dayAttempt.forEach(function(p,i){ var fill=i%2?C_ZEBRA:C_WHITE;
+      setCell("B"+r,p.date,{size:10,fill:fill,align:"center",border:true});
+      setCell("C"+r,p.undated?"\u2014":ordX(p.daySlot),{size:10,fill:fill,align:"center",border:true});
+      setCell("D"+r,p.undated?"\u2014":ordX(p.total),{size:10,fill:fill,align:"center",border:true});
+      setCell("E"+r,p.dialed,{size:10,fill:fill,align:"center",border:true,num:"#,##0"});
+      setCell("F"+r,p.conn,{size:10,fill:fill,align:"center",border:true,num:"#,##0"});
+      if(p.cr==null) setCell("G"+r,"\u2014",{size:10,fill:fill,align:"center",border:true});
+      else setCell("G"+r,p.cr,{size:10,fill:fill,align:"center",border:true,num:"0.0%"});
+      if(p.dailyRate==null) setCell("H"+r,"\u2014",{size:10,fill:fill,align:"center",border:true});
+      else setCell("H"+r,p.dailyRate,{size:10,bold:true,color:C_AMBER,fill:fill,align:"center",border:true,num:"0.0%"});
+      setCell("I"+r,p.overallRate,{size:10,bold:true,color:C_GREEN,fill:fill,align:"center",border:true,num:"0.0%"});
       ws.getRow(r).height=16; r++; });
-    setCell("B"+r,"\u201cCases dialed\u201d = call attempts (dials), not unique cases. Each attempt is shown individually, up to the maximum of "+m.maxAtt+" attempts.",{size:8,italic:true,color:C_GREY,wrap:true});
-    ws.getCell("B"+r).alignment={horizontal:"left",vertical:"top",wrapText:true}; merge("B"+r+":F"+r); ws.getRow(r).height=32;
+    setCell("B"+r,"\u201cCases dialed\u201d = call attempts (dials). Days' Attempt resets each day; Total Attempt counts continuously. Daily connected rate = cumulative cases reached within the day \u00f7 that day's book; Overall connect = cumulative cases reached \u00f7 total book. Dates are IST; dials with no timestamp are shown as 'Undated' so the grid totals Calls Attempted.",{size:8,italic:true,color:C_GREY,wrap:true});
+    ws.getCell("B"+r).alignment={horizontal:"left",vertical:"top",wrapText:true}; merge("B"+r+":I"+r); ws.getRow(r).height=32;
 
     // Daily Trend tab (styled table)
     var ds=wb.addWorksheet("Daily Trend",{views:[{showGridLines:false}]});
@@ -1690,7 +1746,7 @@ setInterval(function(){ if(_dirty) persistNow(); }, 5000);
 window.addEventListener('beforeunload', function(){ if(_dirty) persistNow(); });
 
 function uid(){ return "f"+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
-function showErr(msg){ errBox.innerHTML = msg ? "<div class='err'>"+msg+"</div>" : ""; }
+function showErr(msg){ errBox.innerHTML = msg ? "<div class='err'>"+escapeHtml(msg)+"</div>" : ""; }   // msg contains file names
 
 function readFileToModel(file){
   return new Promise(function(resolve,reject){
@@ -1703,6 +1759,7 @@ function readFileToModel(file){
             var have=res.meta.fields||[]; var miss=need.filter(function(c){return have.indexOf(c)<0;});
             if(miss.length) throw new Error("missing columns: "+miss.join(", "));
             var raw=packRaw(res.data);
+            if(!raw.length) throw new Error("no data rows (file has headers only, or every client_loan_id is blank)");
             resolve({ raw:raw, model:compute(res.data) });
           }catch(e){ reject(e); }
         }, error:function(e){ reject(new Error(e.message)); }});
@@ -1883,14 +1940,15 @@ function syncDurControls(filt){
 }
 
 function startRename(id){
-  var row=document.querySelector(".frow[data-id='"+id+"']"); if(!row) return;
+  var row=document.querySelector(".frow[data-id='"+id+"']"); if(!row||row.querySelector(".edit")) return;   // idempotent
   var f=files.find(function(x){return x.id===id;}); if(!f) return;
-  var nameEl=row.querySelector(".fname");
+  var nameEl=row.querySelector(".fname"); if(!nameEl) return;
+  var done=false;
   var input=document.createElement("input"); input.className="edit"; input.value=f.name;
   nameEl.replaceWith(input); input.focus(); input.select();
-  function commit(){ var v=input.value.trim(); if(v) f.name=v; saveStore(); renderSidebar();
+  function commit(){ if(done) return; done=true; var v=input.value.trim(); if(v) f.name=v; saveStore(); renderSidebar();
     if(f.id===activeId) document.getElementById('curName').textContent=f.name; }
-  input.addEventListener('keydown',function(e){ if(e.key==='Enter'){commit();} else if(e.key==='Escape'){renderSidebar();} });
+  input.addEventListener('keydown',function(e){ if(e.key==='Enter'){commit();} else if(e.key==='Escape'){ done=true; renderSidebar(); } });
   input.addEventListener('blur',commit);
   input.addEventListener('click',function(e){e.stopPropagation();});
 }
@@ -1905,6 +1963,7 @@ function removeFile(id){
 /* sidebar interactions */
 document.getElementById('fileList').addEventListener('click',function(e){
   var row=e.target.closest('.frow'); if(!row) return;
+  if(e.target.closest('.edit')) return;                       // typing in the rename box
   var id=row.getAttribute('data-id');
   var actBtn=e.target.closest('.icobtn');
   if(actBtn){
@@ -1913,8 +1972,15 @@ document.getElementById('fileList').addEventListener('click',function(e){
     else if(act==='remove') removeFile(id);
     return;
   }
+  // Double-click detected here (not via the native dblclick event): a click can rebuild the rail,
+  // so the 2nd click lands on a new element and the browser never fires dblclick.
+  var now=Date.now();
+  if(_lastRowClick.id===id && now-_lastRowClick.t<500){ _lastRowClick={id:null,t:0}; startRename(id); return; }
+  _lastRowClick={id:id,t:now};
+  if(id===activeId) return;                                   // already active: nothing to rebuild
   activeId=id; saveStore(); renderSidebar(); showActive();
 });
+var _lastRowClick={id:null,t:0};
 document.getElementById('fileList').addEventListener('dblclick',function(e){
   var row=e.target.closest('.frow'); if(row) startRename(row.getAttribute('data-id'));
 });
@@ -1988,7 +2054,17 @@ function setPanelCollapsed(c){
   try{ localStorage.setItem('voicebot_fpcollapsed', c?'1':'0'); }catch(e){}
   if(MODEL) setTimeout(function(){ drawChart(MODEL.daily); }, 200); // report width changed
 }
-document.getElementById('fCollapse').addEventListener('click',function(){ setPanelCollapsed(true); });
+/* Narrow screens (<=1080px): the panel is an overlay. Its '‹' button, Escape, or a click outside close it. */
+function fpNarrow(){ return window.matchMedia('(max-width:1080px)').matches; }
+function fpClose(){ document.getElementById('fpanel').classList.remove('open'); }
+document.getElementById('fCollapse').addEventListener('click',function(){ if(fpNarrow()){ fpClose(); return; } setPanelCollapsed(true); });
+document.addEventListener('click',function(e){            // capture phase: target is still attached
+  var fp=document.getElementById('fpanel');
+  if(!fpNarrow() || !fp.classList.contains('open')) return;
+  if(fp.contains(e.target) || e.target.closest('#fpToggle')) return;
+  fpClose();
+},true);
+document.addEventListener('keydown',function(e){ if(e.key==='Escape' && fpNarrow()) fpClose(); });
 document.getElementById('fExpand').addEventListener('click',function(){ setPanelCollapsed(false); });
 (function(){ try{ if(localStorage.getItem('voicebot_fpcollapsed')==='1') document.getElementById('fpanel').classList.add('collapsed'); }catch(e){} })();
 
@@ -2147,13 +2223,13 @@ function exportPdf(){
     ],{1:{halign:'center'},2:{halign:'center',fontStyle:'bold'}});
     note("Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.");
 
-    // 4. Marginal Payoff
-    bar("4.  Marginal Payoff by Attempt");
+    // 4. Marginal Payoff — day-wise
+    bar("4.  Marginal Payoff by Attempt (day-wise)");
     function ordP(n){ n=parseInt(n,10); var s=["th","st","nd","rd"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
-    sectionTable(null,["Attempt","Cases dialed","Connected","Connect rate","Overall connect"],
-      m.payoff.map(function(p){return [(p.b==="4+"?"4th+":ordP(p.b)),fmtInt(p.dialed),fmtInt(p.conn),(p.cr==null?"\u2014":pct(p.cr)),pct(p.ocr)];}),
-      {0:{halign:'center'},1:{halign:'center'},2:{halign:'center'},3:{halign:'center'},4:{halign:'center',fontStyle:'bold',textColor:GREEN}});
-    note("\u201cCases dialed\u201d = call attempts (dials), not unique cases. Each attempt is shown individually, up to the maximum of "+m.maxAtt+" attempts.");
+    sectionTable(null,["Date","Days' Att","Total Att","Cases dialed","Connected","Connect rate","Daily conn rate","Overall connect"],
+      m.dayAttempt.map(function(p){var u=!!p.undated;return [p.date,u?"\u2014":ordP(p.daySlot),u?"\u2014":ordP(p.total),fmtInt(p.dialed),fmtInt(p.conn),(p.cr==null?"\u2014":pct(p.cr)),(p.dailyRate==null?"\u2014":pct(p.dailyRate)),pct(p.overallRate)];}),
+      {0:{halign:'center'},1:{halign:'center'},2:{halign:'center'},3:{halign:'center'},4:{halign:'center'},5:{halign:'center'},6:{halign:'center',fontStyle:'bold',textColor:AMBER},7:{halign:'center',fontStyle:'bold',textColor:GREEN}});
+    note("\u201cCases dialed\u201d = call attempts (dials). Days' Attempt resets each day; Total Attempt counts continuously. Daily connected rate resets each day; Overall connect is cumulative across the campaign. Dates are IST; dials with no timestamp are shown as 'Undated' so the grid totals Calls Attempted.");
 
     // Daily Trend chart (as image)
     var cv=document.getElementById('trend');
