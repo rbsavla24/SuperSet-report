@@ -888,7 +888,7 @@ function compute(rows, filt){
   ans.forEach(function(r){
     var d=toNum(r["Call Duration"]); allDur.push(d);
     var disp=r.disposition;
-    if(disp==="NC") ncDur.push(d);
+    if(disp==="NC"||disp==="RNR") ncDur.push(d);        // non-contact = NC or RNR (locked definition)
     else if(disp==="HUNG_UP") huDur.push(d);
     else if(disp && disp!=="") engaged.push(d);
   });
@@ -900,7 +900,7 @@ function compute(rows, filt){
     var disp=r.disposition;
     if(disp==="PTP"){ ptpCalls++; ptpCaseSet[r.client_loan_id]=1; }
     if(POSITIVE.indexOf(disp)>=0){ posCalls++; posCaseSet[r.client_loan_id]=1; }
-    if(disp==="NC") ncAns++;
+    if(disp==="NC"||disp==="RNR") ncAns++;
     if(!disp||disp==="") blankAns++;
   });
   var ptpCases=Object.keys(ptpCaseSet).length, posCases=Object.keys(posCaseSet).length;
@@ -1285,12 +1285,12 @@ function filterDesc(m){
 }
 function render(m){
   MODEL=m;
-  var posCasePct = m.ca? m.posCases/m.ca:0, ptpCasePct=m.ca? m.ptpCases/m.ca:0;
+  var posCasePct = m.uc? m.posCases/m.uc:0, ptpCasePct=m.ca? m.ptpCases/m.ca:0;   // Positive = firm definition (÷ book); PTP ÷ reached
   var attNote="All dial attempts";
   var extras=Object.keys(m.oddCounts).map(function(k){return m.oddCounts[k]+" "+escapeHtml(k);});   // Call Status values are data
   if(extras.length) attNote+=" (incl. "+extras.join(", ")+" as failed)";
   var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; ";
-  durNote += (m.ncAns>0 && m.ncDur!=null) ? "non-contact (NC) avg = "+m.ncDur.toFixed(1)+"s"
+  durNote += (m.ncAns>0 && m.ncDur!=null) ? "non-contact (NC/RNR) avg = "+m.ncDur.toFixed(1)+"s"
                                           : "hung-up avg = "+(m.huDur!=null?m.huDur.toFixed(1):"\u2013")+"s";
   function ordinal(n){ n=parseInt(n,10); var s=["th","st","nd","rd"], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }
   function attLabel(b){ return b==="4+"?"4th+":ordinal(b); }
@@ -1314,7 +1314,7 @@ function render(m){
     ["Avg call duration (answered)",(m.avgDur!=null?m.avgDur.toFixed(1):"\u2013")+" sec",durNote],
     ["Positive % \u2014 answered calls",posPctS(m.na?m.posCalls/m.na:0),posOK?("All Positive \u00f7 "+fmtInt(m.na)+" (all answered calls)"):"Not applicable under the current disposition filter"],
     ["PTP % \u2014 answered calls",ptpPctS(m.na?m.ptpCalls/m.na:0),ptpOK?("PTP \u00f7 "+fmtInt(m.na)+" (all answered calls)"):"Not applicable under the current disposition filter"],
-    ["Positive % \u2014 unique cases",posPctS(posCasePct),posOK?(fmtInt(m.posCases)+" Positive cases \u00f7 "+fmtInt(m.ca)+" (unique answered cases)"):"Not applicable under the current disposition filter"],
+    ["Positive % \u2014 unique cases",posPctS(posCasePct),posOK?(fmtInt(m.posCases)+" Positive cases \u00f7 "+fmtInt(m.uc)+" cases in book (dashboard definition)"):"Not applicable under the current disposition filter"],
     ["PTP % \u2014 unique cases",ptpPctS(ptpCasePct),ptpOK?(fmtInt(m.ptpCases)+" PTP cases \u00f7 "+fmtInt(m.ca)+" (unique answered cases)"):"Not applicable under the current disposition filter"]
   ];
   var kmRows=km.map(function(x){return "<tr><td>"+x[0]+"</td><td class='val'>"+x[1]+"</td><td class='note'>"+x[2]+"</td></tr>";}).join("");
@@ -1348,7 +1348,7 @@ function render(m){
       "<td class='num green'>"+pct(p.overallRate)+"</td></tr>";
   }).join("");
 
-  var funnelNote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
+  var funnelNote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC/RNR)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
 
   var subLine = m.sub + filterDesc(m);
   var html =
@@ -1357,7 +1357,7 @@ function render(m){
      kpiCell(fmtInt(m.uc),"Unique Cases",false)+
      kpiCell(fmtInt(m.total),"Calls Attempted",false)+
      kpiCell(pct(m.connCase),"Case Connectivity",false)+
-     kpiCell(posPctS(posCasePct),"Positive % \u2014 cases",true)+
+     kpiCell(posPctS(posCasePct),"Positive % \u2014 of book",true)+
      kpiCell(ptpPctS(ptpCasePct),"PTP % \u2014 cases",true)+
    "</div>"+
    "<div class='sec'><h3>1.  Key Metrics</h3><table><tr><th>Metric</th><th class='num'>Value</th><th>Basis / Note</th></tr>"+kmRows+"</table></div>"+
@@ -1474,7 +1474,7 @@ async function exportXlsx(){
     var wb=new ExcelJS.Workbook();
     var ws=wb.addWorksheet("Summary",{views:[{showGridLines:false}],pageSetup:{orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0}});
     ws.columns=[{width:2},{width:36},{width:16},{width:18},{width:16},{width:16},{width:16},{width:18},{width:16},{width:4}];
-    var posCasePct=m.ca?m.posCases/m.ca:0, ptpCasePct=m.ca?m.ptpCases/m.ca:0;
+    var posCasePct=m.uc?m.posCases/m.uc:0, ptpCasePct=m.ca?m.ptpCases/m.ca:0;   // Positive ÷ book (firm)
     var xPosOK=(m.posApplicable!==false), xPtpOK=(m.ptpApplicable!==false), XNA="N.A.";
     function xPos(v){ return xPosOK?v:XNA; } function xPtp(v){ return xPtpOK?v:XNA; }
 
@@ -1495,7 +1495,7 @@ async function exportXlsx(){
 
     // KPI strip
     var kpis=[["Unique Cases",fmtInt(m.uc),C_CHAR],["Calls Attempted",fmtInt(m.total),C_CHAR],
-              ["Case Connectivity",pct(m.connCase),C_CHAR],["Positive % \u2014 cases",xPos(pct(posCasePct)),C_GOLD],
+              ["Case Connectivity",pct(m.connCase),C_CHAR],["Positive % \u2014 of book",xPos(pct(posCasePct)),C_GOLD],
               ["PTP % \u2014 cases",xPtp(pct(ptpCasePct)),C_GOLD]];
     var cols=["B","C","D","E","F"];
     kpis.forEach(function(k,i){ var txt=k[2]===C_GOLD?C_CHAR:C_WHITE;
@@ -1510,7 +1510,7 @@ async function exportXlsx(){
     sectionBar("1.  Key Metrics");
     headerRow([["B","Metric","left"],["C","Value","center"],["D","Basis / Note","left"]]); merge("D"+r+":F"+r); r++;
     var attNote="All dial attempts"; var ex=Object.keys(m.oddCounts).map(function(k){return m.oddCounts[k]+" "+k;}); if(ex.length)attNote+=" (incl. "+ex.join(", ")+" as failed)";
-    var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; "+((m.ncAns>0&&m.ncDur!=null)?"non-contact (NC) avg = "+m.ncDur.toFixed(1)+"s":"hung-up avg = "+(m.huDur!=null?m.huDur.toFixed(1):"\u2013")+"s");
+    var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; "+((m.ncAns>0&&m.ncDur!=null)?"non-contact (NC/RNR) avg = "+m.ncDur.toFixed(1)+"s":"hung-up avg = "+(m.huDur!=null?m.huDur.toFixed(1):"\u2013")+"s");
     var km=[["Unique cases (client_loan_id)",m.uc,"Distinct loans in Journey",false],
       ["Total calls attempted",m.total,attNote,false],
       ["Avg attempts per case",Number(m.avgAtt.toFixed(2)),"Up to "+m.maxAtt+" dials per case",false,"0.00"],
@@ -1521,7 +1521,7 @@ async function exportXlsx(){
       ["Avg call duration (answered)",(m.avgDur!=null?m.avgDur.toFixed(1):"\u2013")+" sec",durNote,false],
       ["Positive % \u2014 answered calls",xPos(m.na?m.posCalls/m.na:0),xPosOK?("All Positive \u00f7 "+fmtInt(m.na)+" (all answered calls)"):"Not applicable under current disposition filter",true],
       ["PTP % \u2014 answered calls",xPtp(m.na?m.ptpCalls/m.na:0),xPtpOK?("PTP \u00f7 "+fmtInt(m.na)+" (all answered calls)"):"Not applicable under current disposition filter",true],
-      ["Positive % \u2014 unique cases",xPos(posCasePct),xPosOK?(fmtInt(m.posCases)+" Positive cases \u00f7 "+fmtInt(m.ca)+" (unique answered cases)"):"Not applicable under current disposition filter",true],
+      ["Positive % \u2014 unique cases",xPos(posCasePct),xPosOK?(fmtInt(m.posCases)+" Positive cases \u00f7 "+fmtInt(m.uc)+" cases in book (dashboard definition)"):"Not applicable under current disposition filter",true],
       ["PTP % \u2014 unique cases",xPtp(ptpCasePct),xPtpOK?(fmtInt(m.ptpCases)+" PTP cases \u00f7 "+fmtInt(m.ca)+" (unique answered cases)"):"Not applicable under current disposition filter",true]];
     km.forEach(function(row,i){ var fill=i%2?C_ZEBRA:C_WHITE;
       setCell("B"+r,row[0],{size:10,fill:fill,border:true});
@@ -1560,7 +1560,7 @@ async function exportXlsx(){
       setCell("D"+r,row[2],{size:10,bold:true,align:"center",color:row[3],fill:fill,border:true,num:(typeof row[2]==="number"?"0.0%":null)});
       merge("D"+r+":F"+r); ["D","E","F"].forEach(function(cl){ws.getCell(cl+r).border=thinBorder();});
       ws.getRow(r).height=16; r++; });
-    var fnote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
+    var fnote="Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC/RNR)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.";
     setCell("B"+r,fnote,{size:8,italic:true,color:C_GREY,wrap:true}); ws.getCell("B"+r).alignment={horizontal:"left",vertical:"top",wrapText:true}; merge("B"+r+":F"+r); ws.getRow(r).height=20; r+=2;
 
     // Section 4 — day-wise
@@ -2133,7 +2133,7 @@ function exportPdf(){
         LIGHT=rgb('D9E1F2'),ZEBRA=rgb('F2F5FB'),GREEN=rgb('548235'),AMBER=rgb('BF8F00'),GREY=rgb('80,80,80'.replace(/,/g,'')||'808080');
     GREY=rgb('808080');
 
-    var posCasePct=m.ca?m.posCases/m.ca:0, ptpCasePct=m.ca?m.ptpCases/m.ca:0;
+    var posCasePct=m.uc?m.posCases/m.uc:0, ptpCasePct=m.ca?m.ptpCases/m.ca:0;   // Positive ÷ book (firm)
     var pPosOK=(m.posApplicable!==false), pPtpOK=(m.ptpApplicable!==false), PNA="N.A.";
     function pPos(v){ return pPosOK?v:PNA; } function pPtp(v){ return pPtpOK?v:PNA; }
     doc.setFillColor(NAVY[0],NAVY[1],NAVY[2]); doc.rect(M,y,W,52,'F');
@@ -2147,7 +2147,7 @@ function exportPdf(){
     // KPI strip (5 tiles)
     var tileH=48, tw=W/5;
     var kpis=[["Unique Cases",fmtInt(m.uc),CHAR],["Calls Attempted",fmtInt(m.total),CHAR],
-              ["Case Connectivity",pct(m.connCase),CHAR],["Positive % \u2014 cases",pPos(pct(posCasePct)),GOLD],
+              ["Case Connectivity",pct(m.connCase),CHAR],["Positive % \u2014 of book",pPos(pct(posCasePct)),GOLD],
               ["PTP % \u2014 cases",pPtp(pct(ptpCasePct)),GOLD]];
     kpis.forEach(function(k,i){
       var x=M+i*tw, col=k[2], txt=(col===GOLD)?CHAR:[255,255,255];
@@ -2186,7 +2186,7 @@ function exportPdf(){
     // 1. Key Metrics
     bar("1.  Key Metrics");
     var attNote="All dial attempts"; var ex=Object.keys(m.oddCounts).map(function(k){return m.oddCounts[k]+" "+k;}); if(ex.length)attNote+=" (incl. "+ex.join(", ")+" as failed)";
-    var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; "+((m.ncAns>0&&m.ncDur!=null)?"non-contact (NC) avg = "+m.ncDur.toFixed(1)+"s":"hung-up avg = "+(m.huDur!=null?m.huDur.toFixed(1):"\u2013")+"s");
+    var durNote="Engaged avg = "+(m.engDur!=null?m.engDur.toFixed(1):"\u2013")+"s; "+((m.ncAns>0&&m.ncDur!=null)?"non-contact (NC/RNR) avg = "+m.ncDur.toFixed(1)+"s":"hung-up avg = "+(m.huDur!=null?m.huDur.toFixed(1):"\u2013")+"s");
     sectionTable(null,["Metric","Value","Basis / Note"],[
       ["Unique cases (client_loan_id)",fmtInt(m.uc),"Distinct loans in Journey"],
       ["Total calls attempted",fmtInt(m.total),attNote],
@@ -2198,7 +2198,7 @@ function exportPdf(){
       ["Avg call duration (answered)",(m.avgDur!=null?m.avgDur.toFixed(1):"\u2013")+" sec",durNote],
       ["Positive % \u2014 answered calls",pPos(pct(m.na?m.posCalls/m.na:0)),pPosOK?("All Positive \u00f7 "+fmtInt(m.na)):"Not applicable under current disposition filter"],
       ["PTP % \u2014 answered calls",pPtp(pct(m.na?m.ptpCalls/m.na:0)),pPtpOK?("PTP \u00f7 "+fmtInt(m.na)):"Not applicable under current disposition filter"],
-      ["Positive % \u2014 unique cases",pPos(pct(posCasePct)),pPosOK?(fmtInt(m.posCases)+" Positive cases \u00f7 "+fmtInt(m.ca)):"Not applicable"],
+      ["Positive % \u2014 unique cases",pPos(pct(posCasePct)),pPosOK?(fmtInt(m.posCases)+" Positive cases \u00f7 "+fmtInt(m.uc)+" cases in book"):"Not applicable"],
       ["PTP % \u2014 unique cases",pPtp(pct(ptpCasePct)),pPtpOK?(fmtInt(m.ptpCases)+" PTP cases \u00f7 "+fmtInt(m.ca)):"Not applicable"]
     ],{0:{cellWidth:190},1:{cellWidth:70,halign:'center',fontStyle:'bold'},2:{fontStyle:'italic',textColor:GREY}});
 
@@ -2221,7 +2221,7 @@ function exportPdf(){
       ["Positive",pPos(fmtInt(m.posCalls)),pPos(pct(m.total?m.posCalls/m.total:0))],
       ["PTP",pPtp(fmtInt(m.ptpCalls)),pPtp(pct(m.total?m.ptpCalls/m.total:0))]
     ],{1:{halign:'center'},2:{halign:'center',fontStyle:'bold'}});
-    note("Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.");
+    note("Note: of "+fmtInt(m.na)+" answered calls, "+fmtInt(m.ncAns)+" are non-contact (NC/RNR)"+(m.blankAns?" and "+fmtInt(m.blankAns)+" carry no disposition":"")+"; kept in the answered base.");
 
     // 4. Marginal Payoff — day-wise
     bar("4.  Marginal Payoff by Attempt (day-wise)");
@@ -2238,8 +2238,15 @@ function exportPdf(){
       bar("Daily Outreach Trend");
       try{
         var data=cv.toDataURL('image/png');
-        var iw=W, ih=Math.min(200, W*0.42);
-        doc.addImage(data,'PNG',M,y,iw,ih); y+=ih+6;
+        var iw=W, ih=Math.min(230, W*(cv.height/cv.width||0.33));   // keep the canvas's true aspect ratio
+        doc.addImage(data,'PNG',M,y,iw,ih); y+=ih+10;
+        // Legend (on screen it's HTML below the canvas, so it isn't part of the image)
+        var LG=[["Total Calls",[31,56,100]],["Unique Cases",[201,162,39]]];
+        doc.setFont('helvetica','normal'); doc.setFontSize(8.5);
+        var lw=LG.reduce(function(s,l){return s+12+doc.getTextWidth(l[0])+16;},0)-16, lx=M+(W-lw)/2;
+        LG.forEach(function(l){ doc.setFillColor(l[1][0],l[1][1],l[1][2]); doc.rect(lx,y-7,8,8,'F');
+          doc.setTextColor(60,60,60); doc.text(l[0],lx+12,y); lx+=12+doc.getTextWidth(l[0])+16; });
+        y+=12;
       }catch(e){}
     }
 
